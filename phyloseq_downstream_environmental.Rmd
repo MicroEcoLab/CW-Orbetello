@@ -1,0 +1,1798 @@
+---
+title: "phyloseq_downstream"
+---
+
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(edgeR)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(cowplot)
+
+```
+
+
+```{r}
+prok <- readRDS("phyloseq_obj.rds")
+
+
+prok
+```
+
+
+
+```{r}
+## Normalizing the asv counts to the median sequencing depth
+prok_ndata <- transform_sample_counts(prok, function(x) ((x/sum(x))*median(microbiome::readcount(prok))))
+
+```
+
+```{r}
+## Normalizing the asv counts as relative abundances
+prok_ndata_ra <- transform_sample_counts(prok_ndata, function(x) x/sum(x) )
+
+```
+
+
+```{r}
+samples_to_remove <- c("PNOV23W")
+prok_ndata <- subset_samples(prok_ndata, !sample_names(prok_ndata) %in% samples_to_remove )
+
+env_samples <- c("UINOV23W","IINOV23W","LAGNOV23W","MARNOV23W",
+                 "UINOV23S","IINOV23S","LAGNOV23S","MARNOV23S")
+
+prok_ndata <- subset_samples(prok_ndata, sample_names(prok_ndata) %in% env_samples )
+
+prok_ndata
+```
+
+
+
+```{r}
+melted <- prok_ndata %>%
+  tax_glom(taxrank = "Family") %>%
+  transform_sample_counts(function (x) {x * 100/sum(x)}) %>%
+  psmelt() %>%
+  select(OTU, Abundance, Sample, Phylum, Class, Order, Family) %>%
+  arrange(OTU) %>%    # Sorting by the column name OTU
+  pivot_wider(names_from = Sample, values_from = Abundance)  %>%
+  rename(
+    ASVs=OTU,
+    CW_inlet_water=UINOV23W,
+    CW_outlet_water=IINOV23W,
+    Lagoon_water=LAGNOV23W,
+    Sea_water=MARNOV23W,
+    CW_inlet_sediment=UINOV23S,
+    CW_outlet_sediment=IINOV23S,
+    Lagoon_sediment=LAGNOV23S,
+    Sea_sediment=MARNOV23S
+  ) %>%
+  select(ASVs, Phylum, Class, Order, Family, CW_inlet_water, CW_outlet_water, Lagoon_water, Sea_water, CW_inlet_sediment, CW_outlet_sediment,Lagoon_sediment,Sea_sediment)
+  
+
+melted
+
+write.table(melted, "./familyAbundance_noFilter.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+```
+
+
+```{r}
+family_abundances <- prok_ndata %>%
+  # Aggregate the OTUs/ASVs at the Family level
+  tax_glom(taxrank = "Family") %>%
+  
+  # Transform the abundance values to relative abundance (percentages) per sample
+  # This divides each abundance value by the total abundance in the sample
+  transform_sample_counts(function (x) {x * 100/sum(x)}) %>%
+  
+  # Convert the phyloseq object into a "long" data frame for easier manipulation
+  psmelt() %>%
+  
+  # Filter to keep only families with more than 1% relative abundance in at least one sample
+  filter(Abundance > 1.00) %>%
+  
+  # Aggiungere la colonna "total_abundance" per ogni Family
+  group_by(Family) %>%
+  mutate(total_abundance = sum(Abundance, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  # Ordinare Family in base alla total_abundance decrescente
+  arrange(desc(total_abundance))
+
+family_abundances
+
+# ---- Filtraggio Classi ----
+# 1. Calcolo in quanti campioni ogni classe è presente (somma sulle famiglie)
+classes_to_keep <- family_abundances %>%
+  group_by(Class, Sample) %>%
+  summarise(present = any(Abundance > 0), .groups = "drop") %>%
+  group_by(Class) %>%
+  summarise(n_samples = sum(present), .groups = "drop") %>%
+  filter(n_samples >= 3) %>%
+  pull(Class)
+
+# 2. Tengo solo le famiglie che appartengono a queste classi
+family_abundances <- family_abundances %>%
+  filter(Class %in% classes_to_keep) %>%
+  arrange(desc(total_abundance))
+
+# L'idea era quella di fare il seguente filtro: Se una Classe ha almeno 3 campioni “coperti” (anche sommando famiglie diverse), allora si tiene.
+
+family_abundances
+```
+
+
+```{r fig.height=8, fig.width=4.4, dpi=300}
+
+# togliere questo in caso
+# Calcolare l'abbondanza totale per ogni classe e riordinare i livelli di 'Class'
+# Per riordinare le facet_grid in ordine di abbondanza di classe
+# le Classi piu abbondanti sopra
+family_abundances <- family_abundances %>%
+  group_by(Class) %>%
+  mutate(total_class_abundance = sum(Abundance, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(Class = factor(Class, levels = unique(Class[order(-total_class_abundance)])))  # Riordina le Classi
+
+
+samples_order <- c("UI_W", "II_W", "LAG_W", "MAR_W",
+                   "UI_S", "II_S", "LAG_S", "MAR_S")
+# To have the desired order inside the facet_grid
+family_abundances$label_id <- factor(family_abundances$label_id, levels = samples_order)
+
+# Riordina i livelli di matrix_env
+family_abundances$matrix_env <- factor(family_abundances$matrix_env,
+                                       levels = c("water", "sediment"),
+                                       labels = c("Water", "Sediment"))
+
+# Without regrouping but only coloring for class
+# Creare il plot
+g <- ggplot(family_abundances, aes(x = label_id, y = reorder(Family, total_abundance))) +
+  geom_point(aes(size = Abundance, fill = Class), alpha = 0.75, shape = 21) +
+  facet_grid(Class ~ matrix_env, scales = "free", space = "free") +  # Ordinamento delle righe in base alla media
+  ylab("Family") +
+  scale_x_discrete(labels = c(
+    "UI_W" = "CW inlet",  "II_W" = "CW outlet",  "LAG_W" = "Lagoon",  "MAR_W" = "Sea",
+    "UI_S" = "CW inlet",  "II_S" = "CW outlet",  "LAG_S" = "Lagoon",  "MAR_S" = "Sea"
+  )) +
+  scale_size_continuous(
+    name="% of total reads",
+    breaks = c(1, 5, 10, 15, 20, 25, 30),  # I valori che vuoi visualizzare nella legenda per la grandezza
+    # range = c(1, 8)  # Adatta la dimensione del pallino, senza esagerare (se max è 30%)
+  ) + 
+  scale_fill_manual(
+    values = c('#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#d25b6a', '#fbbd75', '#ff8f00', '#cab2d6'),
+    name = "Class") +
+  theme_bw(base_size = 9, base_line_size = 0.2) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    # strip.text.y = element_text(angle = 0),  # Etichette delle righe facet_grid orizzontali
+    strip.text.y = element_blank(),  # Rimuove il testo delle righe del facet_grid
+    strip.background = element_blank(),  # Rimuove il box di background delle righe del facet_grid
+    legend.position = "right",
+    panel.grid.major = element_line(color = "grey90")
+  ) +
+  ylab("Families (> 1% of total reads)") +
+  xlab("Samples") +
+  guides(
+    fill = guide_legend(override.aes = list(size = 4))  # Aumenta la dimensione dei pallini nella legenda
+  )
+
+g
+```
+
+
+```{r}
+ggsave("./bubblePlot_Family_1perc_ClassGroup.svg", plot = g, dpi = 300, width = 4.4, height = 8)
+```
+
+
+
+```{r}
+
+library(tidyr)
+
+family_abund_table <- family_abundances[, c("OTU", "Sample", "Abundance", "Phylum", "Class", "Order", "Family")] %>%
+  pivot_wider(names_from = Sample, values_from = Abundance) %>%
+  rename(
+    ASVs=OTU,
+    CW_inlet_water=UINOV23W,
+    CW_outlet_water=IINOV23W, 
+    Lagoon_water=LAGNOV23W, 
+    Sea_water=MARNOV23W, 
+    CW_inlet_sediment=UINOV23S,
+    CW_outlet_sediment=IINOV23S, 
+    Lagoon_sediment=LAGNOV23S,
+    Sea_sediment=MARNOV23S
+  ) %>%
+  select(ASVs, Phylum, Class, Order, Family, CW_inlet_water,CW_outlet_water,Lagoon_water,Sea_water,CW_inlet_sediment,CW_outlet_sediment,Lagoon_sediment,Sea_sediment) %>% #ordering columns
+  as.data.frame()
+
+
+family_abund_table
+
+write.table(family_abund_table, "./familyAbundance_greaterThan1perc_ClassDominant.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+```
+
+
+```{r}
+family_abund_table
+```
+
+
+```{r fig.height=8, fig.width=15}
+# Plot Bar
+
+
+# Phylum
+phylum <- tax_glom(prok_ndata, "Phylum")
+phylum.ra <- transform_sample_counts(phylum, function(x) x/sum(x) )
+
+# Plot Phylum Relative abundances
+plot <- phyloseq::plot_bar(phylum.ra, x="label_id", fill = "Phylum" ) 
+
+  
+plot + theme_bw()
+
+```
+
+
+
+```{r fig.height=8, fig.width=15}
+# TOP 10 PHYLUM
+
+N <- 10
+# SORT
+top10.phylum <- sort(taxa_sums(phylum.ra), decreasing = TRUE)[1:N]
+# GET
+phylum.top10.ra <- prune_taxa(names(top10.phylum), phylum.ra) 
+
+plot_bar(phylum.top10.ra, x="label_id", fill = "Phylum" ) + 
+  facet_grid(~matrix_env, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1.0, hjust=1))
+
+
+plot_bar(phylum.top10.ra, x="label_id", fill = "Phylum" ) + 
+  facet_grid(~water_types, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1.0, hjust=1), 
+        legend.position = "top")
+
+```
+
+
+
+
+
+```{r fig.height=8, fig.width=15}
+# TOP 10 FAMILY
+
+
+# Family
+family <- tax_glom(prok_ndata, "Family")
+family.ra <- transform_sample_counts(family, function(x) x/sum(x) )
+
+N <- 10
+# SORT
+top10.family <- sort(taxa_sums(family.ra), decreasing = TRUE)[1:N]
+# GET
+family.top10.ra <- prune_taxa(names(top10.family), family.ra) 
+
+
+
+plot_bar(family.top10.ra, x="label_id", fill = "Family" ) + 
+  facet_grid(~matrix_env, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+plot_bar(family.top10.ra, x="label_id", fill = "Family" ) + 
+  facet_grid(~water_types, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+
+```{r fig.height=8, fig.width=15}
+# TOP 10 CLASS
+
+
+# Class
+class <- tax_glom(prok_ndata, "Class")
+class.ra <- transform_sample_counts(class, function(x) x/sum(x) )
+
+N <- 10
+# SORT
+top10.class <- sort(taxa_sums(class.ra), decreasing = TRUE)[1:N]
+# GET
+class.top10.ra <- prune_taxa(names(top10.class), class.ra) 
+
+plot_bar(class.top10.ra, x="label_id", fill = "Class" ) + 
+  facet_grid(~matrix_env, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+plot_bar(class.top10.ra, x="label_id", fill = "Class" ) + 
+  facet_grid(~water_types, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+
+
+```{r fig.height=8, fig.width=15}
+# TOP 10 ORDER
+
+
+# Order
+order <- tax_glom(prok_ndata, "Order")
+order.ra <- transform_sample_counts(order, function(x) x/sum(x) )
+
+N <- 10
+# SORT
+top10.order <- sort(taxa_sums(order.ra), decreasing = TRUE)[1:N]
+# GET
+order.top10.ra <- prune_taxa(names(top10.order), order.ra) 
+
+
+
+plot_bar(order.top10.ra, x="label_id", fill = "Order" ) + 
+  facet_grid(~matrix_env, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+plot_bar(order.top10.ra, x="label_id", fill = "Order" ) + 
+  facet_grid(~water_types, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+
+```{r}
+taxa <- as.data.frame(tax_table(prok))
+
+unique(taxa[taxa$Order=="Enterobacterales",]$Genus)
+```
+
+
+
+```{r fig.height=8, fig.width=15}
+# TOP 10 GENUS
+
+
+# Genus
+genus <- tax_glom(prok_ndata, "Genus")
+genus.ra <- transform_sample_counts(genus, function(x) x/sum(x) )
+
+N <- 10
+# SORT
+topN.genus <- sort(taxa_sums(genus.ra), decreasing = TRUE)[1:N]
+# GET
+genus.topN.ra <- prune_taxa(names(topN.genus), genus.ra) 
+
+
+
+plot_bar(genus.topN.ra, x="label_id", fill = "Genus" ) + 
+  facet_grid(~matrix_env, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
+
+plot_bar(genus.topN.ra, x="label_id", fill = "Genus" ) + 
+  facet_grid(~water_types, scales = "free_x") +
+  scale_fill_manual(values = c('#8dd3c7','#ffffb3','#bebada','#fb8072','#80b1d3',
+                               '#fdb462','#b3de69','#fccde5','#d9d9d9','#bc80bd')) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+
+```{r}
+# Alpha diversity
+
+plot_richness(prok_ndata, x="label_id", measures=c("Shannon", "Simpson"), color = "water_types") +
+  geom_boxplot(alpha=0.6) +
+  # facet_grid(~matrix_env, scales = "free", space = "free") + 
+  theme_bw() +
+  theme(legend.position="none", axis.text.x=element_text(angle=45,hjust=1,vjust=1,size=12))
+
+  # theme(axis.text.x = element_text(angle = 45, hjust = 1),
+  #       legend.position = "right",
+  #       panel.grid = element_blank())
+
+
+```
+
+
+```{r}
+# Converting label_id before creating nmds
+
+sample_data(prok_ndata)$label_id <- recode(sample_data(prok_ndata)$label_id,
+  "UI_W" = "CW inlet",  "II_W" = "CW outlet",  
+  "LAG_W" = "Lagoon",   "MAR_W" = "Sea",
+  "UI_S" = "CW inlet",  "II_S" = "CW outlet",  
+  "LAG_S" = "Lagoon",   "MAR_S" = "Sea"
+)
+```
+
+
+
+```{r}
+# Beta diversity - bray
+
+# Replaces prok_ndata with groundwater_phyloseq
+
+nmds_w <- distance(prok_ndata, method = "bray")
+ord_w <- ordinate(prok_ndata, nmds_w, method="NMDS", trymax=1000)
+
+nmds_uw <- distance(prok_ndata, method= "bray", binary=T)
+ord_uw <- ordinate(prok_ndata, nmds_uw, method="NMDS", trymax=1000)
+
+plot_ordination(prok_ndata, ord_w, type="samples",title=paste0("NMDS Weighted Bray similarity, Stress: ", ord_w$stress), color = "matrix_env") +
+  geom_text(aes(label= label_id),
+            colour="#636363",
+          size=3,
+          hjust =-0.0,
+          vjust =-0.5,
+         check_overlap = FALSE) +
+  labs(color="Matrix Env") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(filename = "./NMDS/nmds_weighted_bray.svg", dpi=300)
+ggsave(filename = "./NMDS/nmds_weighted_bray.png", dpi=300)
+
+plot_ordination(prok_ndata, ord_uw, type="samples",title=paste0("NMDS UN-Weighted Bray similarity, Stress: ", ord_uw$stress), color = "matrix_env") +
+  geom_text(aes(label= label_id),
+            colour="#636363",
+          size=3,
+          hjust =-0.0,
+          vjust =-0.5,
+         check_overlap = FALSE) +
+  labs(color="Matrix Env") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(filename = "./NMDS/nmds_unweighted_bray.svg", dpi=300)
+ggsave(filename = "./NMDS/nmds_unweighted_bray.png", dpi=300)
+
+```
+
+
+
+
+```{r}
+
+# Beta diversity - jaccard
+
+# Replaces prok_ndata with groundwater_phyloseq
+
+jacc_nmds_w <- distance(prok_ndata, method = "jaccard")
+jacc_ord_w <- ordinate(prok_ndata, jacc_nmds_w, method="NMDS", trymax=1000)
+
+jacc_nmds_uw <- distance(prok_ndata, method= "jaccard", binary=T)
+jacc_ord_uw <- ordinate(prok_ndata, jacc_nmds_uw, method="NMDS", trymax=1000)
+
+plot_ordination(prok_ndata, jacc_ord_w, type="samples",title=paste0("NMDS Weighted Jaccard similarity, Stress: ", jacc_ord_w$stress), color = "matrix_env") +
+  geom_text(aes(label= label_id),
+            colour="#636363",
+          size=3,
+          hjust =-0.0,
+          vjust =-0.5,
+         check_overlap = FALSE) +
+  labs(color="Matrix Env") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(filename = "./NMDS/nmds_weighted_jaccard.svg", dpi=300)
+ggsave(filename = "./NMDS/nmds_weighted_jaccard.png", dpi=300)
+
+plot_ordination(prok_ndata, jacc_ord_uw, type="samples",title=paste0("NMDS UN-Weighted Jaccard similarity, Stress: ", jacc_ord_uw$stress), color = "matrix_env") +
+  geom_text(aes(label= label_id),
+            colour="#636363",
+          size=3,
+          hjust =-0.0,
+          vjust =-0.5,
+         check_overlap = FALSE) +
+  labs(color="Matrix Env") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(filename = "./NMDS/nmds_unweighted_jaccard.svg", dpi=300)
+ggsave(filename = "./NMDS/nmds_unweighted_jaccard.png", dpi=300)
+
+```
+
+
+```{r}
+
+# Beta diversity - Gower
+
+# Replaces prok_ndata with groundwater_phyloseq
+gower_nmds_w <- distance(prok_ndata, method = "gower")
+gower_ord_w <- ordinate(prok_ndata, gower_nmds_w, method="NMDS", trymax=1000)
+
+gower_nmds_uw <- distance(prok_ndata, method= "gower", binary=T)
+gower_ord_uw <- ordinate(prok_ndata, gower_nmds_uw, method="NMDS", trymax=1000)
+
+plot_ordination(prok_ndata, gower_ord_w, type="samples",title=paste0("NMDS Weighted Gower similarity, Stress: ", gower_ord_w$stress), color = "matrix_env") +
+  geom_text(aes(label= label_id),
+            colour="#636363",
+            size=3,
+            hjust =-0.0,
+            vjust =-0.5,
+            check_overlap = FALSE) +
+  labs(color="Matrix Env") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(filename = "./NMDS/nmds_weighted_gower.svg", dpi=300)
+ggsave(filename = "./NMDS/nmds_weighted_gower.png", dpi=300)
+
+plot_ordination(prok_ndata, gower_ord_uw, type="samples",title=paste0("NMDS UN-Weighted Gower similarity, Stress: ", gower_ord_uw$stress), color = "matrix_env") +
+  geom_text(aes(label= label_id),
+            colour="#636363",
+            size=3,
+            hjust =0.5,
+            vjust =-0.5,
+            check_overlap = FALSE) +
+  labs(color="Matrix Env") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(filename = "./NMDS/nmds_unweighted_gower.svg", dpi=300)
+ggsave(filename = "./NMDS/nmds_unweighted_gower.png", dpi=300)
+
+```
+
+
+```{r}
+pcoa_ord = ordinate(prok_ndata, "PCoA", weighted=TRUE)
+
+plot_ordination(prok_ndata, pcoa_ord, color="matrix_env") +
+  theme_bw()
+
+```
+
+
+
+# Preparing Dataframe for Faprotax
+
+```{r}
+
+
+
+phydf <- as.data.frame(tax_table(prok_ndata))
+
+phydf[is.na(phydf)] <- ""
+
+# columns to paste together
+cols <- c( "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species" )
+
+# create a new column `x` with the three columns collapsed together
+phydf$taxonomy <- apply( phydf[ , cols ] , 1 , function(i){ paste(na.omit(i), collapse = ";") } )
+
+
+# TMMnorm <- function(counts_matrix){
+#   # Main Reference: https://www.biostars.org/p/9465851/
+#   # Secondary References: https://www.biostars.org/p/9475236/
+#   # Samples as colnames
+#   # Features as rownames 
+#   
+#   y <- edgeR::DGEList(as.matrix(counts_matrix))
+#   y <- edgeR::calcNormFactors(y)
+#   
+#   return(as.data.frame(cpm(y, log=TRUE)))#, prior.count=2)))
+# }
+
+otu <- as.data.frame(otu_table(prok_ndata))
+
+# with t_otu samples are in columns and ASVs in rows
+# tmm_otu <- TMMnorm(t_otu)
+# otu_to_merge <- tmm_otu
+
+t_otu <- as.data.frame(t(otu))
+otu_to_merge <- t_otu
+
+
+m <- merge(otu_to_merge, phydf[, "taxonomy", drop=F], by = 0, all.x = T )
+# m
+m$Row.names <- gsub('ASV', 'OTU', m$Row.names)
+colnames(m)[1] <- "OTU"
+# 
+rownames(m) <- m$OTU
+m$OTU <- rownames(m)
+rownames(m) <- NULL
+
+# colnames(otu_faprotax)[1] <- "OTU"
+n <- ncol(m)
+new.order = c(n, 1:(n-1))
+m <- m[, new.order]
+m <- m[, c("taxonomy", "OTU","UINOV23W", "IINOV23W", "LAGNOV23W", "MARNOV23W" ,
+           "UINOV23S", "IINOV23S", "LAGNOV23S", "MARNOV23S" )]
+m
+
+```
+
+
+```{r}
+write.table(m, "./faprotaxTableInput-prok_ndata.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+```
+
+
+# Creare ambiente conda
+mamba env create -n faprotax
+
+# attivare ambiente conda
+mamba activate faprotax
+
+# installare python version 3.7
+mamba install -c conda-forge python=3.7
+
+
+# installazione librerie python
+pip install --upgrade pip 
+
+pip install pandas numpy pipenv coverage pytest-cov python-coveralls flake8 dotmap
+
+pip install biom-format
+
+# L'eseguibile del programma di faprotax è su /mnt/programs
+
+
+Making plots from faprotax results
+
+
+
+
+```{r fig.height=15}
+
+library(pheatmap)
+library(ComplexHeatmap)
+
+faprotax <- as.matrix(read.csv("./faprotax_results_prok-ndata/results.txt", 
+                     sep="\t", row.names = 1))
+
+colnames(faprotax) <- c("CW_inlet_W", "CW_outlet_W", "Lagoon_W", "Sea_W",
+                        "CW_inlet_S", "CW_outlet_S", "Lagoon_S", "Sea_S")
+
+
+faprotax_order <- c("CW_inlet_W", "CW_outlet_W", "Lagoon_W", "Sea_W",
+                    "CW_inlet_S", "CW_outlet_S", "Lagoon_S", "Sea_S")
+
+# Removing samples
+# faprotax <- faprotax[, (colnames(faprotax) %in% env_samples)]
+
+faprotax <- faprotax[which(rowSums(faprotax) > 0), ]
+faprotax <- faprotax[, which(colSums(faprotax) > 0)]
+
+# Crea un'annotazione per i campioni
+annotation_col <- data.frame(
+  Type = factor(c(rep("Water", 4), rep("Sediment", 4)))
+)
+rownames(annotation_col) <- faprotax_order
+ann_colors <- list(Type = c(Water = "#5DADE2", Sediment = "#EB984E"))
+
+
+no_entries <- c("acetoclastic_methanogenesis","methanogenesis_by_disproportionation_of_methyl_groups","methanogenesis_using_formate","methanogenesis_by_CO2_reduction_with_H2","methanogenesis_by_reduction_of_methyl_compounds_with_H2","hydrogenotrophic_methanogenesis","methanogenesis","dark_sulfite_oxidation","arsenate_detoxification","arsenate_respiration","dissimilatory_arsenate_reduction","arsenite_oxidation_detoxification","arsenite_oxidation_energy_yielding","dissimilatory_arsenite_oxidation","anammox","nitrous_oxide_denitrification","knallgas_bacteria","nitrate_ammonification","nitrite_ammonification","manganese_oxidation","invertebrate_parasites","human_pathogens_nosocomia","human_pathogens_meningitis","human_pathogens_gastroenteritis","human_pathogens_diarrhea","fish_parasites","human_gut","mammal_gut","dark_iron_oxidation","chlorate_reducers","nonphotosynthetic_cyanobacteria","anoxygenic_photoautotrophy_H2_oxidizing","anoxygenic_photoautotrophy_Fe_oxidizing","aerobic_anoxygenic_phototrophy","photoheterotrophy","plastic_degradation","reductive_acetogenesis")
+
+
+faprotax <- faprotax[, faprotax_order]
+
+ComplexHeatmap::pheatmap(faprotax,  scale="row", cluster_cols = FALSE, 
+                         annotation_col = annotation_col, annotation_colors = ann_colors,
+                         legend = TRUE,
+                         heatmap_legend_param = list(
+                           title = "Row-scaled abundance",
+                           annotation_legend_side = "bottom",
+                           legend_side = "top"),
+                         main = "Faprotax Metabolism"
+                         )
+
+
+```
+
+
+
+```{r}
+# nitrogen cycle
+nitrogen_cycle <- c("nitrate_ammonification","nitrate_denitrification","nitrate_reduction","nitrate_respiration","nitrification","nitrite_ammonification","nitrite_denitrification","nitrite_respiration","nitrogen_fixation","nitrogen_respiration","nitrous_oxide_denitrification","denitrification","aerobic_ammonia_oxidation","aerobic_nitrite_oxidation")
+
+nitro <- subset(faprotax, rownames(faprotax) %in% nitrogen_cycle)
+
+# nitro <- nitro[which(rowSums(nitro) > 0),]
+# nitro <- nitro[, which(colSums(nitro) > 0)]
+
+nitro[is.nan(nitro)] <- 0
+
+nitro <- nitro[, faprotax_order]
+
+# pheatmap(nitro, scale="row", cluster_cols = FALSE, 
+#          annotation_col = annotation_col, annotation_colors = ann_colors)
+
+p_nitrogen <- ComplexHeatmap::pheatmap(nitro,  scale="row", cluster_cols = FALSE, 
+                         annotation_col = annotation_col, annotation_colors = ann_colors,
+                         legend = TRUE,
+                         heatmap_legend_param = list(
+                           title = "Row-scaled abundance",
+                           annotation_legend_side = "bottom",
+                           legend_side = "top"),
+                         main = "Nitrogen Metabolism"
+                         )
+
+p_nitrogen
+p_nitrogen@matrix
+
+```
+
+
+```{r}
+# Sulfur Cycle
+
+sulfur_cycle <- c("respiration_of_sulfur_compounds","sulfate_respiration","sulfite_respiration","sulfur_respiration","thiosulfate_respiration","dark_sulfide_oxidation","dark_sulfur_oxidation","dark_thiosulfate_oxidation","dark_oxidation_of_sulfur_compounds","dark_sulfite_oxidation")
+
+sulfur <- subset(faprotax, rownames(faprotax) %in% sulfur_cycle)
+
+# sulfur <- sulfur[which(rowSums(sulfur) > 0), ]
+# sulfur <- sulfur[, which(colSums(sulfur) > 0)]
+
+# pheatmap(sulfur, scale="row")
+
+
+sulfur <- sulfur[, faprotax_order]
+
+
+# Crea la heatmap
+# pheatmap(sulfur, scale="row", cluster_cols = FALSE, 
+#          annotation_col = annotation_col, annotation_colors = ann_colors)
+
+p_sulfur <- ComplexHeatmap::pheatmap(sulfur,  scale="row", cluster_cols = FALSE, 
+                         annotation_col = annotation_col, annotation_colors = ann_colors,
+                         legend = TRUE,
+                         heatmap_legend_param = list(
+                           title = "Row-scaled abundance",
+                           annotation_legend_side = "bottom",
+                           legend_side = "top"),
+                         main = "Sulfur Metabolism"
+                         )
+
+
+p_sulfur
+p_sulfur@matrix
+
+```
+
+
+```{r}
+# Carbon Cycle
+
+carbon_cycle <- c("methanotrophy","methanol_oxidation","methylotrophy","chitinolysis","fermentation","aerobic_chemoheterotrophy","aromatic_compound_degradation","photosynthetic_cyanobacteria","reductive_acetogenesis","chemoheterotrophy")
+
+carbon <- subset(faprotax, rownames(faprotax) %in% carbon_cycle)
+
+# carbon <- carbon[which(rowSums(carbon) > 0),]
+# carbon <- carbon[, which(colSums(carbon) > 0)]
+
+# pheatmap(carbon, scale="row", cluster_cols = FALSE, 
+#          annotation_col = annotation_col, annotation_colors = ann_colors)
+
+carbon <- carbon[, faprotax_order]
+
+p<- ComplexHeatmap::pheatmap(carbon,  scale="row", cluster_cols = FALSE, 
+                         annotation_col = annotation_col, annotation_colors = ann_colors,
+                         legend = TRUE,
+                         heatmap_legend_param = list(
+                           title = "Row-scaled abundance",
+                           annotation_legend_side = "bottom",
+                           legend_side = "top"),
+                         main = "Carbon Metabolism"
+                         )
+
+p
+p@matrix
+```
+
+
+```{r}
+
+# Pathogens 
+
+pathogens_list <- c("human_associated","human_pathogens_all","human_pathogens_pneumonia","human_pathogens_septicemia","intracellular_parasites","animal_parasites_or_symbionts","plant_pathogen","predatory_or_exoparasitic")
+
+
+patho <- subset(faprotax, rownames(faprotax) %in% pathogens_list)
+
+# patho <- patho[which(rowSums(patho) > 0), ]
+# patho <- patho[, which(colSums(patho) > 0)]
+
+patho <- patho[, faprotax_order]
+
+# pheatmap(patho, scale="row", cluster_cols = FALSE, 
+#          annotation_col = annotation_col, annotation_colors = ann_colors)
+
+p_patho <- ComplexHeatmap::pheatmap(patho,  scale="row", cluster_cols = FALSE, 
+                         annotation_col = annotation_col, annotation_colors = ann_colors,
+                         legend = TRUE,
+                         heatmap_legend_param = list(
+                           title = "Row-scaled abundance",
+                           annotation_legend_side = "bottom",
+                           legend_side = "top"),
+                         main = "Pathogens"
+                         )
+
+p_patho
+p_patho@matrix
+
+patho
+```
+
+
+```{r fig.width=3.5, fig.height=4}
+library(reshape2)
+
+patho_df <- as.data.frame(patho)
+patho_df$pathogens <- rownames(patho_df)  # aggiunge una colonna con i nomi di riga
+
+patho_melt <- melt(patho_df, id.vars = "pathogens", value.name = "Abundance", na.rm = FALSE)
+
+# Unisci questa informazione al melt
+patho_melt <- left_join(
+  patho_melt, 
+  data.frame(variable = faprotax_order, matrix_env = rep(c("Water", "Sediment"), each = 4)), 
+  by = "variable"
+)
+
+# Reorder to have Water first and then Sediment
+patho_melt$matrix_env <- factor(patho_melt$matrix_env, levels = c("Water", "Sediment"))
+
+
+plotbar_PATHOGENS <- ggplot(patho_melt, aes(x = variable, y = Abundance, fill = pathogens)) +
+  geom_bar(stat = "identity", position = "stack", color="black", size = 0.3) +
+  theme_bw() +
+  facet_grid(~matrix_env, scales = "free", space = "free") +  
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",  "CW_outlet_W" = "CW outlet",  "Lagoon_W" = "Lagoon",  "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",  "CW_outlet_S" = "CW outlet",  "Lagoon_S" = "Lagoon",  "Sea_S" = "Sea"
+  )) +
+  labs(x = "Sample", y = "Relative abundance of FAPROTAX functions", fill = "Potential Pathogenic Function") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_blank())
+
+
+# Estrai solo la legenda
+PATHOGENS_legend <- get_legend(plotbar_PATHOGENS +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+plotbar_PATHOGENS
+ggsave(plot = plotbar_PATHOGENS, filename = "plotbar_PATHOGENS.svg", dpi=300, width=3.5, height=4)
+
+# Mostra solo la legenda
+plot_grid(PATHOGENS_legend)
+ggsave(filename = "plotbar_PATHOGENS_legend.svg", dpi=300, width=3.5, height=4)
+
+
+```
+
+
+```{r fig.height=3.6, fig.width=3.5}
+carbon_df <- as.data.frame(carbon)
+carbon_df$carbon_metab <- rownames(carbon_df)  # aggiunge una colonna con i nomi di riga
+
+carbon_melt <- melt(carbon_df, id.vars = "carbon_metab", value.name = "Abundance", na.rm = FALSE)
+
+# Unisci questa informazione al melt
+carbon_melt <- left_join(
+  carbon_melt, 
+  data.frame(variable = faprotax_order, matrix_env = rep(c("Water", "Sediment"), each = 4)), 
+  by = "variable"
+)
+
+# Reorder to have Water first and then Sediment
+carbon_melt$matrix_env <- factor(carbon_melt$matrix_env, levels = c("Water", "Sediment"))
+
+
+plotbar_CARBON <- ggplot(carbon_melt, aes(x = variable, y = Abundance, fill = carbon_metab)) +
+  geom_bar(stat = "identity", position = "stack", color="black", size = 0.3) +
+  theme_bw() +
+  facet_grid(~matrix_env, scales = "free", space = "free") +  
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",  "CW_outlet_W" = "CW outlet",  "Lagoon_W" = "Lagoon",  "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",  "CW_outlet_S" = "CW outlet",  "Lagoon_S" = "Lagoon",  "Sea_S" = "Sea"
+  )) +
+  labs(x = "Sample", y = "FAPROTAX Functional Abundance", fill = "Carbon metabolism") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_blank())
+
+# Estrai solo la legenda
+carbon_legend <- get_legend(plotbar_CARBON +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+plotbar_CARBON
+ggsave(plot = plotbar_CARBON, filename = "plotbar_CARBON.svg", dpi=300, width=3.5, height=3.6)
+
+# Mostra solo la legenda
+plot_grid(carbon_legend)
+ggsave(filename = "plotbar_CARBON_legend.svg", dpi=300, width=3.5, height=3.6)
+
+
+
+
+
+
+```
+
+
+```{r}
+carbon_melt %>%
+  select(-matrix_env) %>%
+  pivot_wider(names_from = variable, values_from = Abundance) %>%
+  as.matrix()
+
+
+nitrogen_melt %>%
+  select(-matrix_env) %>%
+  pivot_wider(names_from = variable, values_from = Abundance, values_fill = 0) %>% 
+  as.matrix()
+
+sulfur_melt %>%
+  select(-matrix_env) %>%
+  pivot_wider(names_from = variable, values_from = Abundance, values_fill = 0)
+
+patho_melt %>%
+  select(-matrix_env) %>%
+  pivot_wider(names_from = variable, values_from = Abundance, values_fill = 0) %>% 
+  as.matrix()
+```
+
+
+```{r fig.height=3.6, fig.width=3.5}
+nitrogen_df <- as.data.frame(nitro)
+
+nitrogen_df$nitrogen_metab <- rownames(nitrogen_df)  # aggiunge una colonna con i nomi di riga
+
+nitrogen_melt <- melt(nitrogen_df, id.vars = "nitrogen_metab", value.name = "Abundance", na.rm = FALSE)
+
+# Unisci questa informazione al melt
+nitrogen_melt <- left_join(
+  nitrogen_melt, 
+  data.frame(variable = faprotax_order, matrix_env = rep(c("Water", "Sediment"), each = 4)), 
+  by = "variable"
+)
+
+# Reorder to have Water first and then Sediment
+nitrogen_melt$matrix_env <- factor(nitrogen_melt$matrix_env, levels = c("Water", "Sediment"))
+
+
+plotbar_NITROGEN <- ggplot(nitrogen_melt, aes(x = variable, y = Abundance, fill = nitrogen_metab)) +
+  geom_bar(stat = "identity", position = "stack", color="black", size = 0.3) +
+  theme_bw() +
+  facet_grid(~matrix_env, scales = "free", space = "free") +  
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",  "CW_outlet_W" = "CW outlet",  "Lagoon_W" = "Lagoon",  "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",  "CW_outlet_S" = "CW outlet",  "Lagoon_S" = "Lagoon",  "Sea_S" = "Sea"
+  )) +
+  labs(x = "Sample", y = "FAPROTAX Functional Abundance", fill = "Nitrogen metabolism") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_blank())
+
+
+# Estrai solo la legenda
+nitrogen_legend <- get_legend(plotbar_NITROGEN +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+plotbar_NITROGEN
+ggsave(plot = plotbar_NITROGEN, filename = "plotbar_NITROGEN.svg", dpi=300, width=3.5, height=3.6)
+
+# Mostra solo la legenda
+plot_grid(nitrogen_legend)
+ggsave(filename = "plotbar_NITROGEN_legend.svg", dpi=300, width=3.5, height=3.6)
+
+
+
+```
+
+
+
+
+```{r fig.height=3.6, fig.width=3.5}
+sulfur_df <- as.data.frame(sulfur)
+sulfur_df$sulfur_metab <- rownames(sulfur_df)  # aggiunge una colonna con i nomi di riga
+
+sulfur_melt <- melt(sulfur_df, id.vars = "sulfur_metab", value.name = "Abundance", na.rm = FALSE)
+
+# Unisci questa informazione al melt
+sulfur_melt <- left_join(
+  sulfur_melt, 
+  data.frame(variable = faprotax_order, matrix_env = rep(c("Water", "Sediment"), each = 4)), 
+  by = "variable"
+)
+
+# Reorder to have Water first and then Sediment
+sulfur_melt$matrix_env <- factor(sulfur_melt$matrix_env, levels = c("Water", "Sediment"))
+
+
+sulfur_plot <- ggplot(sulfur_melt, aes(x = variable, y = Abundance, fill = sulfur_metab)) +
+  geom_bar(stat = "identity", position = "stack", color="black", size = 0.3) +
+  theme_bw() +
+  facet_grid(~matrix_env, scales = "free", space = "free") +  
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",  "CW_outlet_W" = "CW outlet",  "Lagoon_W" = "Lagoon",  "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",  "CW_outlet_S" = "CW outlet",  "Lagoon_S" = "Lagoon",  "Sea_S" = "Sea"
+  )) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  labs(x = "Sample", y = "FAPROTAX Functional Abundance", fill = "Sulfur metabolism") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_blank())
+
+
+# Estrai solo la legenda
+sulfur_legend <- get_legend(sulfur_plot +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+sulfur_plot
+ggsave(plot = sulfur_plot, filename = "plotbar_SULFUR.png", dpi=300, width=3.5, height=3.6)
+
+
+# Mostra solo la legenda
+plot_grid(sulfur_legend)
+ggsave(filename = "plotbar_SULFUR_legend.png", dpi=300, width=3.5, height=3.6)
+
+
+
+
+
+```
+ 
+
+# Bar Plot Pathogens Genus
+
+```{r}
+library(readr)
+
+pathogens_files <- c("human_associated.txt","human_pathogens_all.txt",
+                     "human_pathogens_pneumonia.txt","human_pathogens_septicemia.txt",
+                     "intracellular_parasites.txt","animal_parasites_or_symbionts.txt",
+                     "plant_pathogen.txt","predatory_or_exoparasitic.txt")
+
+master_pathogens <- data.frame()
+
+for (f in pathogens_files) {
+  pathogenus <- read_delim(paste0("./faprotax_results_prok-ndata/subdir_groups_faprotax/", f), 
+                         delim = "\t", skip = 1)
+  # pathogenus$file <- f
+  
+  master_pathogens <- rbind(master_pathogens, pathogenus)
+}
+
+master_pathogens <- master_pathogens[!duplicated(master_pathogens), ]
+
+```
+
+
+```{r}
+pathogenus_summed <- master_pathogens %>%
+  group_by(record) %>%
+  summarise(across(where(is.numeric), sum), .groups = "drop") %>%
+  as.data.frame()
+
+rownames(pathogenus_summed) <- pathogenus_summed$record
+
+pathogenus_summed
+```
+
+
+```{r}
+# from WIDE format (Data.Frame) to  LONG format
+pathogenus_melt <- melt(pathogenus_summed, id.vars = "record", value.name = "Abundance", na.rm = FALSE)
+pathogenus_melt
+
+```
+
+
+```{r fig.width=7, fig.height=7}
+
+pathogenus_split <- pathogenus_melt %>%
+  separate(record,
+           into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+           sep = ";",
+           fill = "right",      # Se mancano livelli
+           extra = "drop") %>%  # Se ci sono più di 7 livelli
+  as.data.frame() %>%
+  mutate(variable = as.character(variable))
+
+pathogenus_split$Sample <- pathogenus_split$variable
+pathogenus_split$variable <- NULL
+
+# Adding matrix_env column based on last character of Sample occurrences
+pathogenus_split <- pathogenus_split %>%
+  mutate(matrix_env = ifelse(grepl("W$", Sample), "Water",
+                             ifelse(grepl("S$", Sample), "Sediment", NA)))
+
+
+# Adding order of Samples
+desired_order <- c("UINOV23W", "IINOV23W", "LAGNOV23W", "MARNOV23W",
+                   "UINOV23S", "IINOV23S", "LAGNOV23S", "MARNOV23S")
+pathogenus_split <- pathogenus_split %>%
+  mutate(Sample = factor(Sample, levels = desired_order))
+
+
+# Adding order for Matrix Env grouping
+pathogenus_split <- pathogenus_split %>%
+  mutate(matrix_env = factor(matrix_env, levels = c("Water", "Sediment")))
+
+```
+
+
+```{r fig.width=4, fig.height=4.3}
+
+library(rlang)  # per sym() e !!
+library(RColorBrewer)
+
+level <- "Order"  # oppure "Genus", "Phylum", ecc.
+
+# Aggregazione dinamica
+pathogenus_summarised <- pathogenus_split %>%
+  group_by(Sample, matrix_env, !!sym(level)) %>%
+  summarise(Abundance = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Order = ifelse(Order == "", "_Others (~70% Rickettsiales)", Order))
+
+
+genus_set_19 <- c(
+  "#C44E52", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#FFFF33", "#A65628", "#F781BF", "#999999", "#66C2A5",
+  "#E31A1C", "#8DA0CB", "#A6D854", "#57dcfa", "#FFD92F",
+  "#E5C494", "#B3B3B3", "#1B9E77", "#D95F02"
+)
+
+order_set_19 <- c(
+  "#377EB8", "#A6D854", "#FF7F00", "#57dcfa",
+  "#A65628", "#E31A1C", "#FFFF33", "#999999", "#66C2A5",
+  "#8DA0CB", "#C44E52", "#E5C494", "#B3B3B3"
+)
+
+# Plot dinamico
+plot_pathogenus <- ggplot(pathogenus_summarised, aes(x = Sample, y = Abundance, fill = !!sym(level))) +
+  geom_bar(stat = "identity", position = "stack", color = "black", size = 0.3) +
+  theme_bw() +
+  facet_grid(~matrix_env, scales = "free", space = "free") +
+  scale_x_discrete(labels = c(
+    "UINOV23W" = "CW inlet",  "IINOV23W" = "CW outlet",  
+    "LAGNOV23W" = "Lagoon",   "MARNOV23W" = "Sea",
+    "UINOV23S" = "CW inlet",  "IINOV23S" = "CW outlet",  
+    "LAGNOV23S" = "Lagoon",   "MARNOV23S" = "Sea"
+  )) +
+  scale_fill_manual(values=order_set_19) +
+  labs(x = "Sample", 
+       y = paste("FAPROTAX Pathogens", level, "Abundances"), 
+       fill = level) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_blank())
+
+
+
+# Estrai solo la legenda
+pathogenus_legend <- get_legend(plot_pathogenus +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+plot_pathogenus
+ggsave(plot = plot_pathogenus, filename = "Pathoorder_plotbar.svg", dpi=300, width=4, height=4.3)
+
+
+# Mostra solo la legenda
+plot_grid(pathogenus_legend)
+ggsave(filename = "Pathoorder_plotbar_legend.svg", dpi=300, width=4, height=4.3)
+
+
+```
+
+
+```{r fig.width=3.5, fig.height=4}
+
+level <- "Genus"  # oppure "Genus", "Order", ecc.
+
+# Aggregazione dinamica
+pathogenus_summarised <- pathogenus_split %>%
+  group_by(Sample, matrix_env, !!sym(level)) %>%
+  summarise(Abundance = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Genus = ifelse(Genus == "", "_Others (~70% Rickettsiales)", Genus))
+
+# Calcola i top 10 generi in base all'abbondanza totale
+top10_genera <- pathogenus_summarised %>%
+  group_by(Genus) %>%
+  summarise(total_abundance = sum(Abundance)) %>%
+  arrange(desc(total_abundance)) %>%
+  slice_head(n = 10) %>%
+  pull(Genus)
+
+# Filtra il dataframe originale per mantenere solo i top 10 generi
+top10_pathogenus_summarised <- pathogenus_summarised %>%
+  filter(Genus %in% top10_genera)
+
+top10_genus_set_19 <- c(
+  "#C44E52", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00",
+  "#FFFF33", "#A65628", "#F781BF", "#999999", "#66C2A5"
+)
+
+# Plot dinamico
+plot_top10_pathogenus <- ggplot(top10_pathogenus_summarised, 
+                                aes(x = Sample, y = Abundance, fill = !!sym(level))) +
+  geom_bar(stat = "identity", position = "stack", color = "black", size = 0.3) +
+  theme_bw() +
+  facet_grid(~matrix_env, scales = "free", space = "free") +
+  scale_x_discrete(labels = c(
+    "UINOV23W" = "CW inlet",  "IINOV23W" = "CW outlet",  
+    "LAGNOV23W" = "Lagoon",   "MARNOV23W" = "Sea",
+    "UINOV23S" = "CW inlet",  "IINOV23S" = "CW outlet",  
+    "LAGNOV23S" = "Lagoon",   "MARNOV23S" = "Sea"
+  )) +
+  scale_fill_manual(values=top10_genus_set_19) +
+  labs(x = "Sample", 
+       y = "Potential pathogenic genera (total reads)", 
+       fill = level) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        panel.grid = element_blank())
+
+# Estrai solo la legenda
+top10_pathogenus_legend <- get_legend(plot_top10_pathogenus +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+plot_top10_pathogenus
+ggsave(plot = plot_top10_pathogenus, filename = "TOP10_Pathogenus_plotbar.svg", dpi=300, width=3.5, height=4)
+
+
+# Mostra solo la legenda
+plot_grid(top10_pathogenus_legend)
+ggsave(filename = "TOP10_Pathogenus_plotbar_legend.svg", dpi=300, width=3.5, height=4)
+
+```
+
+
+```{r}
+pathogenus_split[, c("Phylum", "Class", "Order", "Family", "Genus")] %>%
+  arrange(Genus)
+```
+
+
+```{r}
+df <- pathogenus_split[pathogenus_split$Genus=="", ]
+
+```
+
+```{r}
+# Conta le occorrenze
+order_counts <- table(df$Order)
+
+# Calcola la percentuale
+order_percentages <- prop.table(order_counts) * 100
+
+# Converti in data.frame per leggibilità
+order_percentages_df <- as.data.frame(order_percentages)
+colnames(order_percentages_df) <- c("Order", "Percentage")
+
+# Ordina in ordine decrescente di percentuale (opzionale)
+order_percentages_df <- order_percentages_df[order(order_percentages_df$Percentage, decreasing = TRUE), ]
+
+order_percentages_df
+```
+
+```{r}
+# Filtra per Genus vuoto e campione "Sea_W"
+df <- pathogenus_split[pathogenus_split$Genus == "",]
+df$newSample <- as.character(df$Sample)
+
+df <- df[df$newSample == "UINOV23W", ]
+
+# Conta le occorrenze nella colonna "order"
+order_counts <- table(df$Order)
+
+# Calcola la percentuale
+order_percentages <- prop.table(order_counts) * 100
+
+# Converti in data.frame
+order_percentages_df <- as.data.frame(order_percentages)
+order_percentages_df
+colnames(order_percentages_df) <- c("Order", "Percentage")
+
+# Arrotonda e ordina (opzionale)
+order_percentages_df$Percentage <- round(order_percentages_df$Percentage, )
+order_percentages_df <- order_percentages_df[order(order_percentages_df$Percentage, decreasing = TRUE), ]
+order_percentages_df
+```
+
+
+```{r}
+pathogenus_split %>%
+  group_by(Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE)) %>%
+  mutate(Percentage = 100 * Total_Abundance / sum(Total_Abundance)) %>%
+  arrange(desc(Total_Abundance))
+```
+
+
+# gloobal NMDS (diversity + citometry + biolog)
+
+```{r}
+diversity <- family_abundances %>%
+  select(Family, Sample, Abundance) %>%
+  pivot_wider(
+    names_from = Sample,
+    values_from = Abundance
+  ) %>%
+  as.data.frame() %>%
+  rename(
+    CW_outlet_W = IINOV23W,
+    CW_inlet_W = UINOV23W,
+    Lagoon_W = LAGNOV23W,
+    Sea_W = MARNOV23W,
+    CW_outlet_S = IINOV23S,
+    CW_inlet_S = UINOV23S,
+    Lagoon_S = LAGNOV23S,
+    Sea_S = MARNOV23S
+  ) %>%
+  select(Family, CW_inlet_W, CW_outlet_W, Lagoon_W, Sea_W, 
+         CW_inlet_S, CW_outlet_S, Lagoon_S, Sea_S) %>%
+  replace(is.na(.), 0)
+
+rownames(diversity) <- diversity$Family
+diversity$Family <- NULL
+
+diversity
+```
+
+
+```{r}
+
+diversity_T <- t(diversity)
+
+# Calcola Shannon index
+shannon <- vegan::diversity(diversity_T, index = "shannon")
+# Se vuoi un dataframe con i risultati:
+shannon_df <- data.frame(Sample = names(shannon), Shannon = shannon)
+shannon_df$Sample <- NULL
+
+shannon_df <- as.data.frame(t(shannon_df))[, c("CW_inlet_W", "CW_outlet_W",
+                                               "Lagoon_W", "Sea_W",
+                                               "CW_inlet_S", "CW_outlet_S",
+                                               "Lagoon_S", "Sea_S")]
+
+shannon_df
+```
+
+
+
+```{r}
+cytometry <- as.data.frame(t(read.csv(file = "./global_NMDS/cytometry_abundances.tsv", sep="\t", row.names = 1)))
+cytometry
+
+```
+
+
+```{r}
+biolog_c <- read.csv(file = "./global_NMDS/Biolog_carbon.txt", sep="\t", row.names = 1) 
+biolog_c["tot_metabolic", ] <- colSums(biolog_c)
+biolog_c
+
+biolog_n <- read.csv(file = "./global_NMDS/Biolog_nitrogen.txt", sep="\t", row.names = 1)
+biolog_n["tot_metabolic", ] <- colSums(biolog_n)
+biolog_n
+
+# Aggiungi il suffisso ai rownames
+rownames(biolog_c) <- paste0(rownames(biolog_c), "_c")
+rownames(biolog_n) <- paste0(rownames(biolog_n), "_n")
+
+# Per togliere gli spazi ai rownames
+rownames(biolog_c) <- make.names(rownames(biolog_c))
+rownames(biolog_n) <- make.names(rownames(biolog_n))
+
+# Unisci i due data frame
+biolog <- rbind(biolog_c, biolog_n)
+biolog["shannon_biolog", ] <- c(7.294, 7.881, 8.171, 7.854,
+                                6.946, 8.813, 9.990, 7.315)
+
+
+```
+
+
+```{r}
+library(tibble)
+
+
+global_pathogens <- pathogenus_summarised %>%
+  select(Genus, Sample, Abundance) %>%
+  pivot_wider(
+    names_from = Sample,
+    values_from = Abundance
+  ) %>%
+  as.data.frame() %>%
+  rename(
+    CW_outlet_W = IINOV23W,
+    CW_inlet_W = UINOV23W,
+    Lagoon_W = LAGNOV23W,
+    Sea_W = MARNOV23W,
+    CW_outlet_S = IINOV23S,
+    CW_inlet_S = UINOV23S,
+    Lagoon_S = LAGNOV23S,
+    Sea_S = MARNOV23S
+  ) %>%
+  select(Genus, CW_inlet_W, CW_outlet_W, Lagoon_W, Sea_W, 
+         CW_inlet_S, CW_outlet_S, Lagoon_S, Sea_S)
+
+rownames(global_pathogens) <- global_pathogens$Genus
+global_pathogens$Genus <- NULL
+global_pathogens <- global_pathogens[rownames(global_pathogens) != "_Others (~70% Rickettsiales)", ]
+global_pathogens
+
+summed_pathogenus <- pathogenus_summarised %>%
+  select(Sample, Abundance) %>%
+  group_by(Sample) %>%
+  summarise(pathogenus_sum = sum(Abundance, na.rm = TRUE)) %>%
+  column_to_rownames("Sample") %>%
+  t() %>%
+  as.data.frame() %>%
+  rename(
+    CW_outlet_W = IINOV23W,
+    CW_inlet_W = UINOV23W,
+    Lagoon_W = LAGNOV23W,
+    Sea_W = MARNOV23W,
+    CW_outlet_S = IINOV23S,
+    CW_inlet_S = UINOV23S,
+    Lagoon_S = LAGNOV23S,
+    Sea_S = MARNOV23S
+  ) %>%
+  select(CW_inlet_W, CW_outlet_W, Lagoon_W, Sea_W, 
+         CW_inlet_S, CW_outlet_S, Lagoon_S, Sea_S)
+
+
+
+
+```
+
+
+```{r}
+amr <- read.csv("AMR_otu_raw.tsv", sep="\t") %>%
+  rename(
+    CW_outlet_W = OUTLET_w,
+    CW_inlet_W = INLET_w,
+    Lagoon_W = LAGOON_w,
+    Sea_W = SEA_w,
+    CW_outlet_S = OUTLET_s,
+    CW_inlet_S = INLET_s,
+    Lagoon_S = LAGOON_s,
+    Sea_S = SEA_s
+  ) %>%
+  select(CW_inlet_W, CW_outlet_W, Lagoon_W, Sea_W, 
+         CW_inlet_S, CW_outlet_S, Lagoon_S, Sea_S)
+
+rownames(amr) <- gsub(" antibiotic", "", rownames(amr))
+
+amr["total_AMR", ] <- colSums(amr, na.rm = TRUE)
+
+amr
+```
+
+
+
+```{r}
+# AMR
+global <- rbind(diversity, cytometry, biolog, global_pathogens, summed_pathogenus, shannon_df, amr)
+global
+
+```
+
+
+```{r}
+library(vegan)
+library(ggrepel)
+
+# Phenols_n Polymers_n 
+#         0          0
+global <- global[rowSums(global) > 0, ]
+global_t <- log10(t(global) + 1)  # campioni ora sulle righe
+# global_t <- t(global)  # campioni ora sulle righe
+
+
+# 2. NMDS
+set.seed(42)
+nmds <- metaMDS(global_t, distance = "gower", trymax = 100)
+
+# 3. Envfit con i taxa
+fit_taxa <- envfit(nmds, global_t, permutations = 999)
+
+# 4. Estrai le coordinate dei campioni
+nmds_scores <- as.data.frame(scores(nmds, display = "sites"))
+nmds_scores$SampleID <- rownames(nmds_scores)
+
+# 5. Estrai vettori dei taxa significativi (p < 0.05)
+vectors <- scores(fit_taxa, display = "vectors")
+vectors_pvals <- fit_taxa$vectors$pvals
+vectors_df <- as.data.frame(vectors[vectors_pvals <= 0.05, ])
+vectors_df$Taxon <- rownames(vectors_df)
+
+as.data.frame(vectors_pvals)
+
+nmds_scores <- nmds_scores %>%
+  mutate(matrix_env = ifelse(grepl("W$", SampleID), "Water",
+                             ifelse(grepl("S$", SampleID), "Sediment", NA)),
+         shape_group = case_when(
+            grepl("^CW_inlet", SampleID) ~ "CW_inlet",
+            grepl("^CW_outlet", SampleID) ~ "CW_outlet",
+            grepl("^Lagoon", SampleID) ~ "Lagoon",
+            grepl("^Sea", SampleID) ~ "Sea"
+          )
+        )
+
+
+scale_factor <- 0.35
+
+ggplot() +
+  geom_segment(data = vectors_df,
+               aes(x = 0, y = 0, xend = NMDS1 * scale_factor, yend = NMDS2 * scale_factor),
+               arrow = arrow(length = unit(0.1, "in")),
+               color = "lightgray", size = 0.6, alpha = 0.5) +
+  geom_point(data = nmds_scores,
+             aes(x = NMDS1, y = NMDS2, fill = matrix_env, shape = shape_group),
+             size = 4.5, color = "black") +
+  scale_shape_manual(values = c(
+    "CW_inlet" = 24,   # quadrato
+    "CW_outlet" = 25,  # triangolo
+    "Lagoon" = 22,     # cerchio
+    "Sea" = 21         # cerchio pieno
+  )) +
+  scale_fill_manual(
+    values = c(Water = "#5DADE2", Sediment = "#EB984E"),
+    guide = guide_legend(override.aes = list(shape = 21)) 
+  ) +
+  geom_text_repel(data = vectors_df,
+                  aes(x = NMDS1 * scale_factor, y = NMDS2 * scale_factor, label = Taxon),
+                  size = 3, color = "darkgreen", max.overlaps = 100) +
+  theme_bw() +
+  theme(legend.position = "right", panel.grid = element_blank()) +
+  labs(x = "NMDS1", y = "NMDS2",
+    shape = "Sample", fill = "Type"
+  ) +
+  guides(
+    shape = guide_legend(order = 1),
+    fill = guide_legend(order = 2, override.aes = list(shape = 21))
+  )
+
+ggsave("global_NMDS.png", dpi=300, width=9, height=6)
+
+```
+
+
+```{r}
+# 1. Estrai tutti i vettori
+all_vectors <- as.data.frame(scores(fit_taxa, display = "vectors"))
+all_vectors$Taxon <- rownames(all_vectors)
+
+# 2. Aggiungi i p-value
+all_vectors$pval <- fit_taxa$vectors$pvals[rownames(all_vectors)]
+
+# 3. Aggiungi una colonna 'line_type' per ggplot
+all_vectors$line_type <- ifelse(all_vectors$pval <= 0.01, "solid", "dashed")
+
+all_vectors
+```
+
+
+```{r}
+
+biolog_vectors <- as.data.frame(all_vectors[rownames(biolog), ])
+
+ggplot() +
+  geom_point(data=nmds_scores, aes(x=NMDS1, y=NMDS2, color=matrix_env), size=2) +
+   geom_text_repel(data = nmds_scores,
+                  aes(x = NMDS1, y = NMDS2, label = SampleID),
+                  size = 3, color = "dodgerblue") +
+  geom_segment(data=biolog_vectors,
+               aes(x = 0, y = 0, linetype=line_type,
+                   xend = NMDS1*scale_factor, yend = NMDS2*scale_factor),
+               arrow = arrow(length = unit(0.1, "in")),
+               color = "gray", size = 0.6) +
+
+  geom_text_repel(data = biolog_vectors,
+            aes(x = NMDS1 *scale_factor* 1, y = NMDS2 *scale_factor* 1, label = Taxon),
+            size = 3, color = "darkred", max.overlaps = 100) +
+
+  theme_bw() +
+    theme(legend.position = "right",
+        panel.grid = element_blank()) +
+  labs(title = "NMDS with envfit vectors",
+       x = "NMDS1", y = "NMDS2")
+
+```
+
+
+```{r}
+
+amr_vectors <- as.data.frame(all_vectors[rownames(amr), ])
+
+ggplot() +
+  geom_point(data=nmds_scores, aes(x=NMDS1, y=NMDS2, color=matrix_env), size=2) +
+   geom_text_repel(data = nmds_scores,
+                  aes(x = NMDS1, y = NMDS2, label = SampleID),
+                  size = 3, color = "dodgerblue") +
+  geom_segment(data=amr_vectors,
+               aes(x = 0, y = 0, linetype=line_type,
+                   xend = NMDS1*scale_factor, yend = NMDS2*scale_factor),
+               arrow = arrow(length = unit(0.1, "in")),
+               color = "gray", size = 0.6) +
+
+  geom_text_repel(data = amr_vectors,
+            aes(x = NMDS1 *scale_factor* 1, y = NMDS2 *scale_factor* 1, label = Taxon),
+            size = 3, color = "darkred", max.overlaps = 100) +
+
+  theme_bw() +
+    theme(legend.position = "right",
+        panel.grid = element_blank()) +
+  labs(title = "NMDS with envfit vectors",
+       x = "NMDS1", y = "NMDS2")
+
+```
+
+
+# Kruskal
+
+```{r}
+
+krusk_df_WS <- data.frame(
+  Shannon = c(shannon_df$CW_inlet_W, shannon_df$CW_outlet_W, 
+              shannon_df$Lagoon_W, shannon_df$Sea_W,
+              shannon_df$CW_inlet_S, shannon_df$CW_outlet_S, 
+              shannon_df$Lagoon_S, shannon_df$Sea_S),
+  Type = c(rep("Water", 4), rep("Sediment", 4))
+)
+
+krusk_df_WS
+
+kruskal.test(Shannon ~ Type, data = krusk_df_WS)
+
+
+krusk_df_CWENV <- data.frame(
+  Shannon = c(shannon_df$CW_inlet_W, shannon_df$CW_outlet_W, 
+              shannon_df$CW_inlet_S, shannon_df$CW_outlet_S,
+              shannon_df$Lagoon_W, shannon_df$Sea_W,
+              shannon_df$Lagoon_S, shannon_df$Sea_S),
+  Location = c(rep("CW", 4), rep("Environment", 4))
+)
+
+kruskal.test(Shannon ~ Location, data = krusk_df_CWENV)
+
+```
+
+
+# Permanova
+
+```{r}
+
+abund_t <- t(diversity)
+
+abund_t
+
+group_df <- data.frame(
+  Sample = colnames(diversity),
+  Matrix = c(rep("Water", 4), rep("Sediment", 4)),        # oppure ordina come preferisci
+  Origin = c("CW", "CW", "Environment", "Environment",    # esempio: 2 CW + 2 Env per tipo
+             "CW", "CW", "Environment", "Environment")
+)
+
+group_df
+
+```
+
+
+```{r}
+# assicura che l’ordine dei sample in group_df sia lo stesso della matrice trasposta
+group_df <- group_df[match(rownames(abund_t), group_df$Sample), ]
+group_df
+```
+
+
+```{r}
+adonis2_result1 <- adonis2(abund_t ~ Matrix, data = group_df, method = "bray")
+adonis2_result1
+
+```
+
+
+```{r}
+adonis2_result2 <- adonis2(abund_t ~ Origin, data = group_df, method = "bray")
+adonis2_result2
+```
+
+
+
+```{r}
+
+prok_diversity <- as.data.frame(otu_table(prok_ndata_ra))[c("UINOV23W", "IINOV23W", "LAGNOV23W", "MARNOV23W", "UINOV23S", "IINOV23S", "LAGNOV23S", "MARNOV23S"),]
+
+rownames(prok_diversity) <- c("CW_inlet_W", "CW_outlet_W", "Lagoon_W", "Sea_W", "CW_inlet_S", "CW_outlet_S", "Lagoon_S", "Sea_S")
+
+prok_diversity <- as.matrix(prok_diversity)
+
+# head(prok_diversity)
+
+```
+
+
+```{r}
+
+prok_group_df <- data.frame(
+  Sample = rownames(prok_diversity),
+  Matrix = c(rep("Water", 4), rep("Sediment", 4)),        # oppure ordina come preferisci
+  Origin = c("CW", "CW", "Environment", "Environment",    # esempio: 2 CW + 2 Env per tipo
+             "CW", "CW", "Environment", "Environment"),
+  in_out = c("CW_in", "CW_out", "Env", "Env",    # esempio: 2 CW + 2 Env per tipo
+             "CW_in", "CW_out", "Env", "Env")
+)
+
+
+# assicura che l’ordine dei sample in group_df sia lo stesso della matrice trasposta
+prok_group_df <- prok_group_df[match(rownames(prok_diversity), prok_group_df$Sample), ]
+prok_group_df
+
+
+```
+
+```{r}
+adonis2(prok_diversity ~ Matrix, data = prok_group_df, method = "bray")
+
+adonis2(prok_diversity ~ Origin, data = prok_group_df, method = "bray")
+```
+
+
+
+# Permanova on NMDS Matrix DATA
+```{r}
+adonis2(global_t ~ Matrix, data = prok_group_df, method = "gower", permutations = 9990)
+
+adonis2(global_t ~ Origin, data = prok_group_df, method = "gower", permutations = 9990)
+
+adonis2(global_t ~ in_out, data = prok_group_df, method = "gower", permutations = 9990)
+```
+
