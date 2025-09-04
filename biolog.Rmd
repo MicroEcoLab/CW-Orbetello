@@ -1,0 +1,251 @@
+---
+title: "R Notebook"
+---
+
+```{r}
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(cowplot)
+```
+
+
+```{r}
+
+df <- read.csv("../Biolog_respiration.txt", sep="\t")
+df
+
+```
+
+
+```{r}
+
+resp_melt <- melt(df, value.name = "Abundance", na.rm = FALSE)
+colnames(resp_melt) <- c("Sample", "Abundance")
+
+# Adding matrix_env column based on last character of Sample occurrences
+resp_melt <- resp_melt %>%
+  mutate(matrix_env = ifelse(grepl("W$", Sample), "Water",
+                             ifelse(grepl("S$", Sample), "Sediment", NA)))
+
+# Adding order for Matrix Env grouping
+resp_melt <- resp_melt %>%
+  mutate(matrix_env = factor(matrix_env, levels = c("Water", "Sediment")))
+
+resp_melt
+```
+
+
+```{r fig.width=3.5, fig.height=3.5}
+
+p <- ggplot(resp_melt, aes(x=Sample, y=Abundance, fill=Sample)) + 
+  geom_boxplot(outlier.size = 0.7) +
+  facet_grid(~matrix_env, scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid = element_blank()
+  ) +
+  geom_jitter(size=0.7) +
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",  "CW_outlet_W" = "CW outlet",  
+    "Lagoon_W" = "Lagoon",   "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",  "CW_outlet_S" = "CW outlet",  
+    "Lagoon_S" = "Lagoon",   "Sea_S" = "Sea"
+  )) +
+  labs(y="OD (590 nm)")
+
+p
+
+ggsave(filename = "../plots/biolog/boxplot_respiration.svg", dpi=300, width = 3.4, height = 3.5)
+```
+
+
+```{r}
+
+carbon <- read.csv("../Biolog_carbon.txt", sep="\t")
+
+
+# manually inserted, obtained from the excel file
+carbon_std <- c(
+  "CW_inlet_W"=0.00109706519758892 ,
+  "CW_outlet_W"=0.010504728421989,
+  "Lagoon_W"=0.011285459702747,  
+  "Sea_W"=0.000637190334896362,
+  "CW_inlet_S" =0.000615383795714419,
+  "CW_outlet_S"=0.010698688969516,
+  "Lagoon_S" =0.0102338935720969,
+  "Sea_S" =0.00063375856661695
+)
+
+cmelt <- melt(carbon, id.vars = "X", value.name = "Abundance", na.rm = FALSE)
+colnames(cmelt) <- c("Carbon", "Sample", "Abundance")
+
+# Adding matrix_env column based on last character of Sample occurrences
+cmelt <- cmelt %>%
+  mutate(matrix_env = ifelse(grepl("W$", Sample), "Water",
+                             ifelse(grepl("S$", Sample), "Sediment", NA)))
+
+# Adding order for Matrix Env grouping
+cmelt <- cmelt %>%
+  mutate(matrix_env = factor(matrix_env, levels = c("Water", "Sediment")))
+
+cmelt
+carbon_std
+```
+
+
+```{r}
+# Calcola somma per Sample per posizionare l’errore
+bar_tops <- cmelt %>%
+  group_by(Sample, matrix_env) %>%
+  summarise(summed = sum(Abundance), .groups = "drop") %>%
+  mutate(sd = carbon_std[Sample])
+
+bar_tops
+
+```
+
+
+
+```{r fig.width=3.5, fig.height=3.5}
+
+carbon_colors <- c("#7EAB55", "#4F71BE", "#6A99D0", "#DE8344", "#A5A5A5", "#F5C242")
+
+carbon_plot <- ggplot(cmelt, aes(x=Sample, y=Abundance, fill=Carbon)) + 
+  geom_bar(stat = "identity", position = "stack", color = "black", size = 0.3) +
+  geom_errorbar(data = bar_tops,
+                aes(x = Sample, ymin = summed, ymax = summed + sd),
+                inherit.aes = FALSE,
+                width = 0.3, size = 0.3) +
+  facet_grid(~matrix_env, scales = "free", space = "free") +
+  labs(y="OD (590 nm)", fill="Carbon Metabolism") +
+  scale_fill_manual(values=carbon_colors) +
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",
+    "CW_outlet_W" = "CW outlet",  
+    "Lagoon_W" = "Lagoon",
+    "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",
+    "CW_outlet_S" = "CW outlet",  
+    "Lagoon_S" = "Lagoon",
+    "Sea_S" = "Sea"
+  )) +
+  coord_cartesian(ylim = c(0, 0.08)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid = element_blank()
+  )
+
+
+
+# Estrai solo la legenda
+carbon_legend <- get_legend(carbon_plot +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+carbon_plot
+ggsave(plot = carbon_plot, filename = "../plots/biolog/biolog_carbon_metabolism.svg", dpi=300, width=3.5, height=3.5)
+
+plot_grid(carbon_legend)
+ggsave(filename = "../plots/biolog/LEGEND_biolog_carbon_metabolism.svg", dpi=300, width=3.5, height=3.5)
+
+```
+
+
+
+```{r}
+
+nitrogen <- read.csv("../Biolog_nitrogen.txt", sep="\t")
+
+# manually inserted, obtained from the excel file
+nitrogen_std <- c(
+  "CW_inlet_W"=0.000228387895827554,
+  "CW_outlet_W"=0.000994429313716811,
+  "Lagoon_W"=0.00111110274480233,  
+  "Sea_W"=0.00114724219524651,
+  "CW_inlet_S"=0.000615055905715673,
+  "CW_outlet_S"=0.000321085753237135,
+  "Lagoon_S"=0.000564121024640884,
+  "Sea_S"=0.000683466472185659
+)
+
+nmelt <- melt(nitrogen, id.vars = "X", value.name = "Abundance", na.rm = FALSE)
+colnames(nmelt) <- c("Nitrogen", "Sample", "Abundance")
+
+# Adding matrix_env column based on last character of Sample occurrences
+nmelt <- nmelt %>%
+  mutate(matrix_env = ifelse(grepl("W$", Sample), "Water",
+                             ifelse(grepl("S$", Sample), "Sediment", NA)))
+
+# Adding order for Matrix Env grouping
+nmelt <- nmelt %>%
+  mutate(matrix_env = factor(matrix_env, levels = c("Water", "Sediment")))
+
+nmelt
+nitrogen_std
+```
+
+
+```{r}
+# Calcola somma per Sample per posizionare l’errore
+nitrogen_bar_tops <- nmelt %>%
+  group_by(Sample, matrix_env) %>%
+  summarise(summed = sum(Abundance), .groups = "drop") %>%
+  mutate(sd = nitrogen_std[Sample])
+
+nitrogen_bar_tops
+```
+
+
+```{r fig.width=3.5, fig.height=3.5}
+
+nitrogen_colors <- c("#7EAB55", "#4F71BE", "#6A99D0", "#DE8344", "#A5A5A5", "#F5C242")
+
+nitrogen_plot <- ggplot(nmelt, aes(x=Sample, y=Abundance, fill=Nitrogen)) + 
+  geom_bar(stat = "identity", position = "stack", color = "black", size = 0.3) +
+  geom_errorbar(data = nitrogen_bar_tops,
+                aes(x = Sample, ymin = summed, ymax = summed + sd),
+                inherit.aes = FALSE,
+                width = 0.3, size = 0.3) +
+  facet_grid(~matrix_env, scales = "free", space = "free") +
+  labs(y="OD (590 nm)", fill="Nitrogen Metabolism") +
+  scale_fill_manual(values=nitrogen_colors) +
+  scale_x_discrete(labels = c(
+    "CW_inlet_W" = "CW inlet",  "CW_outlet_W" = "CW outlet",  
+    "Lagoon_W" = "Lagoon",   "Sea_W" = "Sea",
+    "CW_inlet_S" = "CW inlet",  "CW_outlet_S" = "CW outlet",  
+    "Lagoon_S" = "Lagoon",   "Sea_S" = "Sea"
+  )) +
+  coord_cartesian(ylim = c(0, 0.08)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid = element_blank()
+  )
+
+
+
+
+# Estrai solo la legenda
+nitrogen_legend <- get_legend(nitrogen_plot +
+                              theme(legend.position = "right",
+                                    legend.title = element_text(size = 10),
+                                    legend.text = element_text(size = 9)))
+
+nitrogen_plot
+ggsave(plot = nitrogen_plot, filename = "../plots/biolog/biolog_nitrogen_metabolism.svg", dpi=300, width=3.5, height=3.5)
+
+plot_grid(nitrogen_legend)
+ggsave(filename = "../plots/biolog/LEGEND_biolog_nitrogen_metabolism.svg", dpi=300, width=3.5, height=3.5)
+
+
+```
+
+
+
